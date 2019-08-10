@@ -1,0 +1,585 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+!!!!
+# packages 
+```{r} 
+library(mirt) 
+library(dplyr) 
+``` 
+  
+# mirt fake sim data 
+```{r} 
+theta <- seq(-4, 4, .5)
+a <- matrix(c( 
+.8,.4,NA,NA,
+.4,.4,NA,NA,
+.7,.4,NA,NA, 
+.8,NA,.4,NA, 
+.4,NA,.4,NA, 
+.7,NA,.4,NA,
+.8,NA,NA,.4, 
+.4,NA,NA,.4, 
+.7,NA,NA,.4
+),ncol=4,byrow=TRUE) 
+
+ic_ref <- c(1,1,1,2,2,2,3,3,3)
+d <- c(-1,1.5,0.0,-1.5,1,2,-1.5,1,2) 
+items <- rep("2PL", 9) 
+dataset <- simdata(a,d,2000,items) 
+dataset2 <- matrix(nrow = nrow(dataset), 
+                   ncol = ncol(dataset)) 
+for(i in 1:nrow(dataset2)) { 
+  for(j in 1:ncol(dataset2)) { 
+    if (dataset[i,j] == 1) { 
+      dataset2[i,j] = TRUE 
+    } else { 
+      dataset2[i,j] = FALSE 
+    } 
+  } 
+} 
+  
+dataset.1 <- as.data.frame(dataset) %>%  
+  group_by(Item_1,Item_2,Item_3,Item_4,Item_5,Item_6,
+           Item_7,Item_8,Item_9) %>%  
+  summarise(count = n()) 
+dataset2 <- dataset[,-ncol(dataset.1)] 
+rp_n <- dataset.1[,ncol(dataset.1)] 
+dataset.2 <- dataset.1[,-ncol(dataset.1)] 
+dataset.2_ss <- rowSums(dataset.2)
+hist(dataset.2_ss)
+unique(dataset.2_ss)
+# collapsed data set
+ds_short <- as.data.frame(dataset) %>%  
+  group_by(Item_1,Item_2,Item_3,Item_4,Item_5,Item_6) %>%  
+  summarise(count = n())
+ds_short_rp <- ds_short[,-ncol(ds_short)] %>% 
+  as.data.frame()
+ds_short_rpn <- ds_short[,ncol(ds_short)] %>% 
+  as.data.frame()
+ds_short_rpn2 <- as.numeric(ds_short_rpn[,1])
+``` 
+
+## dist stuff
+#norm_dist_2d and marg_dist_2d
+```{r}
+## norm_dist_2d
+norm_dist_2d <- function(theta_gen, theta_spec) { 
+  dist_m <- matrix(0,length(theta_gen),length(theta_gen)) 
+  phi <- 0#toDo 
+  for (i in 1:length(theta_gen)) { 
+    for (j in 1:length(theta_spec)) { 
+      dist_m[i,j] <- exp(-0.5*(theta_gen[i]^2+theta_spec[j]^2-2*phi*theta_gen[i]*theta_spec[j])/(1-phi*phi)) 
+    } 
+  } 
+  dist_m <- dist_m/sum(dist_m) 
+  return(dist_m) 
+} 
+
+## marg_dist_2d
+marg_dist_2d <- function(dist_2d) {
+  n_quad <- nrow(dist_2d)
+  dist_m <- rep(0, n_quad)
+  for (i in 1:n_quad) {
+    for (j in 1:n_quad) {
+      dist_m[i] <- dist_m[i] + dist_2d[i,j]
+    }
+  }
+  return(dist_m)
+}
+```
+# trace_surface and ts_list
+```{r}
+##trace_surface
+trace_surface <- function(a_gen, a_spec, b, theta_gen, theta_spec) { 
+  ts <- matrix(nrow = length(theta), ncol = length(theta)) 
+  for(q1 in 1:length(theta_gen)) {    
+    for(q2 in 1:length(theta_spec)) {    
+      ts[q1,q2] <- 1/(1 + exp(-(a_gen * theta_gen[q1] + a_spec * theta_spec[q2] + b))) 
+    }    
+  }  
+  return(ts) 
+} 
+# ts_list
+ts_list <- function(a_gen, a_spec, b, rp, rp_n, ic_ref, theta) { 
+  ic_n <- length(unique(ic_ref)) # calculating the number of unique item clusters 
+  gaussian_1d <- marg_dist_2d(norm_dist_2d(theta, theta)) 
+  ts_list <- list() # list containing  trace surfaces for all rp_n 
+  
+  # compute trace surfaces and storeing them in a list indexed by ic 
+  ts_list <- list() 
+  jth_item <- 0 # this references the item number irredardless of ic 
+  for (ic_counter in 1:ic_n) { 
+    ts_list[[ic_counter]] <- list() 
+    ic_nitem <- length(ic_ref[ic_ref == ic_counter]) # finding the number of items in that particular ic 
+    for(j in 1:ic_nitem) { 
+      jth_item <- jth_item + 1 
+      ts_list[[ic_counter]][[j]] <- trace_surface(a_gen = a_gen[jth_item], 
+                                                  a_spec = a_spec[jth_item], 
+                                                  b = b[jth_item], 
+                                                  theta_gen = theta, 
+                                                  theta_spec = theta) 
+      
+    } 
+  }   
+  return(ts_list) 
+} 
+```
+# lw2.0 stuff
+```{r}
+## sumAcrossIc mainly for use in the lw2.0 alg
+sumAcrossIc <- function(x,scores, theta) {
+  out <- list()
+  for(i in 1:length(scores)) {
+    out[[i]] <- list()
+    out[[i]][["SS"]] <- list()
+    out[[i]][["lik"]] <- list()
+    out[[i]][["lik"]] <- matrix(rep(0, length(theta)*length(theta)), 
+                                nrow = length(theta), 
+                                ncol = length(theta)) 
+    out[[i]][["SS"]] <- scores[i]
+    for(j in 1:length(x)) {
+      if(out[[i]][["SS"]] == x[[j]]$SS) {
+        out[[i]][["lik"]] <- out[[i]][["lik"]] + x[[j]]$lik
+      }
+    }
+  }
+  return(out)
+}
+
+## lw2
+# ends with the 
+lw2 <- function(ts_list_object,
+                theta,
+                ic_index) { 
+  n_quad <- length(theta)
+  dist_2d <- norm_dist_2d(theta, theta)  
+  marg_2d <- marg_dist_2d(dist_2d)  
+  
+  lw_iter <- list()
+  lw_final_iter <- list()
+  iter_n <- 0
+  for(ic in 1:length(ts_list_object)) {
+    lw_final_iter[[ic]] <- list()
+    lw_iter[[ic]] <- list()
+    lw_iter[[ic]][[1]] <- list() # the first lw iter for the ic(th) ic
+    lw_iter[[ic]][[1]] <- list() # for binomial item this has a length of 2 for the first iter, then doubles 
+    # first item in ic. X = 1
+    lw_iter[[ic]][[1]][[1]] <- list()
+    lw_iter[[ic]][[1]][[1]][["lik"]] <- ts_list_object[[ic]][[1]]
+    lw_iter[[ic]][[1]][[1]][["SS"]] <- 1
+    # first item in ic. X = 0
+    lw_iter[[ic]][[1]][[2]] <- list()
+    lw_iter[[ic]][[1]][[2]][["lik"]] <- 1 - ts_list_object[[ic]][[1]]
+    lw_iter[[ic]][[1]][[2]][["SS"]] <- 0
+    for(ic_item in 2:length(ts_list_object[[ic]])) { # for ic_item in the number of items in the current ic
+      lw_iter[[ic]][[ic_item]] <- list()
+      #rep(lw_iter[[ic]][[n_items-1]], 2) # 2 for binomial
+      iter_minus1_length <- length(lw_iter[[ic]][[ic_item-1]])
+      for(i in 1:iter_minus1_length) { # i does not line 
+        # adding p of the current item
+        lw_iter[[ic]][[ic_item]][[i]] <- list()
+        lw_iter[[ic]][[ic_item]][[i]][["lik"]] <- lw_iter[[ic]][[ic_item-1]][[i]][["lik"]]*ts_list_object[[ic]][[ic_item]]
+        lw_iter[[ic]][[ic_item]][[i]][["SS"]] <- lw_iter[[ic]][[ic_item-1]][[i]][["SS"]] + 1
+        # adding q of the current item
+        lw_iter[[ic]][[ic_item]][[i+iter_minus1_length]] <- list()
+        lw_iter[[ic]][[ic_item]][[i+iter_minus1_length]][["lik"]] <- lw_iter[[ic]][[ic_item-1]][[i]][["lik"]]*(1-ts_list_object[[ic]][[ic_item]])
+        lw_iter[[ic]][[ic_item]][[i+iter_minus1_length]][["SS"]] <- lw_iter[[ic]][[ic_item-1]][[i]][["SS"]] # + 0        
+      }
+    }
+    SS_vec <- c(0, seq(1,length(ts_list_object[[ic]])))
+    lw_final_iter[[ic]] <- sumAcrossIc(x = lw_iter[[ic]][[length(lw_iter[[ic]])]],
+                                       scores = SS_vec,
+                                       theta = theta) # this sums all liks in an ic by SS
+  }
+  return(lw_final_iter)
+}
+```
+
+## E_ss_cal, EandL_ss
+# E_ss_cal - computes E_ss_cal from LW.2 output
+```{r}
+E_ss_cal <- function(lw2_object, theta) { 
+  gaussian_1d <- marg_dist_2d(norm_dist_2d(theta, theta))
+  #L_ss_s_list <- list() # I believe this is just what is in the lw2_object
+  E_ss_s_list <- list() 
+  E_ss_list_temp <- list() 
+  L_ss_list <- list()
+  logLik <- 0
+  for (ic_counter in 1:length(lw2_object)) {
+    E_ss_s_list[[ic_counter]] <- list()
+    for(ss in 1:length(lw2_object[[ic_counter]])) {
+      E_ss_s_list[[ic_counter]][[ss]] <- list()
+      E_ss_s_list[[ic_counter]][[ss]][["SS"]] <- lw2_object[[ic_counter]][[ss]][["SS"]]
+      for (q in 1:length(theta)) {  
+        temp <- lw2_object[[ic_counter]][[ss]][["lik"]][q,]*gaussian_1d # temp vector containing the product  
+        E_ss_s_list[[ic_counter]][[ss]][["lik"]][q] <- sum(temp) # integrating out the specific dim 
+      }       
+    }
+  }
+  E_ss_list_temp <- list() 
+  E_ss_list_temp[[1]] <- E_ss_s_list[[1]] # initializing the E_ss_list_temp with the first ic
+  for(ic_counter in 2:length(E_ss_s_list)) {
+    E_ss_list_temp[[ic_counter]] <- list()
+    iter <- 0
+    for(i in 1:length(E_ss_list_temp[[ic_counter-1]])) {
+      for(j in 1:length(E_ss_s_list[[ic_counter]])) {
+        iter <- iter + 1
+        E_ss_list_temp[[ic_counter]][[iter]] <- list()
+        E_ss_list_temp[[ic_counter]][[iter]][["lik"]] <- E_ss_list_temp[[ic_counter-1]][[i]][["lik"]] * E_ss_s_list[[ic_counter]][[j]][["lik"]]
+        E_ss_list_temp[[ic_counter]][[iter]][["SS"]] <- E_ss_list_temp[[ic_counter-1]][[i]][["SS"]] + E_ss_s_list[[ic_counter]][[j]][["SS"]]
+      }
+    }
+  }
+  E_ss_list_temp2 <- E_ss_list_temp[[length(E_ss_list_temp)]] # E_ss_list_temp2 still needs to be summed accross the different tlines with the same SS
+  out <- list()
+  out[["E_ss_s_list"]] <- E_ss_s_list
+  out[["E_ss_list_temp"]] <- E_ss_list_temp2 # this is what goes into "EandL_ss" to generate the ss marginal probs and E_ss. !!! also it should be remembered that E_ss_list_temp has yet to be summed across sum scores 
+  return(out) 
+}
+
+# EandL_ss
+library(dplyr)
+EandL_ss <- function(x, theta) {
+  marg2d <- marg_dist_2d(norm_dist_2d(theta, theta))
+  SS <- numeric()
+  lik <- matrix(rep(0, length(theta)*length(x)),nrow = length(x), ncol = length(theta)) 
+  #lik <- data.frame()
+  for(i in 1:length(x)) {
+    SS[i] <- x[[i]][["SS"]]
+    lik[i,] <- x[[i]][["lik"]]
+  }
+  SS_lik <- as.data.frame(cbind(SS,lik))
+  E_ss <- SS_lik %>% 
+    group_by(SS) %>% 
+    summarise_all(funs(sum))
+  L_ss <- numeric()
+  for(ss in 1:nrow(E_ss)) {
+    L_ss[ss] <- sum(E_ss[ss,-1]*marg2d)
+  }
+  out <- list()
+  out[["E_ss"]] <- E_ss
+  out[["L_ss"]] <- L_ss
+  return(out)
+}
+```
+
+
+## r_ij_ss
+- for each rp i need an r0 and r1 table that for EACH ss has a different r0 and r1 for each ic
+- wait! EandL_ss gives me "E_ss", which i can use for calculating r0 and r1, just as long as i divide it by the relivent L_ss_s
+- i need to look more into what EandL_ss does with x. I cant tell whether it is working with Ess
+- 1st index by r0 and r1, 2nd by ic
+- !! or maybe i put the E_ss through a modified LW2 that for each ic_ss that leads to the E_ss, i divide the E_ss by the L_ss_s and then finilly divide by L_ss. !!!! or instead does E_ss need to be divided by the sum of each L_ss_s that was involved to compute E_ss?
+- the main question is what to divide E_ss by, is it by
+- ! though what i do know is that it needs to equal L_ss*
+# r_ij_ss 7
+```{r}
+r_ssj <- function(
+                    lw2_object,
+                    theta,
+                    ic_ref
+                    ) {
+  E_ss_object <- E_ss_cal(lw2_object = lw2_object, theta = theta) # this is E_ss that has yet to be summed accross ss, which is why it is a "temp"
+  EandL_ss_out <- EandL_ss(x = E_ss_object[["E_ss_list_temp"]], theta = theta)
+  E_ss_s_object <- E_ss_object[["E_ss_s_list"]]
+  L_ss_s_object <- lw2_object # !! the output of the lw2 fun is the L_ss_s_object
+  E_ss_object <- EandL_ss_out[["E_ss"]]
+  L_ss_object <- EandL_ss_out[["L_ss"]] 
+  out <- list()
+  out[["E_ss_s_object"]] <- E_ss_s_object
+  out[["L_ss_s_object"]] <- L_ss_s_object
+  out[["E_ss_object"]] <- E_ss_object
+  out[["L_ss_object"]] <- L_ss_object
+  
+  # the lw_em function outs the last lw iter for each ic - trace-surfaces w/ the same ss still need to be summed for each ic 
+  lw_em_out <- lw_em(E_ss_s_object = E_ss_s_object, L_ss_s_object = L_ss_s_object)
+  out[["r_ssj_object"]] <- r_ssj_object
+  return(out)
+}
+```
+
+#r_ssj2 
+- i need to sum across ic's
+```{r}
+r_ssj2 <- function(E_ss_s_object, L_ss_s_object, nitems, theta) {
+  out <- list()
+  lw_final_iter <- list()
+  ic_summed <- list() # has the final ss from the perspective of each ic
+  
+  for(ic in 1:length(L_ss_s_object)) {
+    ic_summed[[ic]] <- list()
+    out[[ic]] <- list()
+    out[[ic]][[1]] <- list()
+    out[[ic]][[1]] <- L_ss_s_object[[ic]]
+    for(i in 2:length(L_ss_s_object)) {
+      out[[ic]][[i]] <- list()
+      m1_len <- length(out[[ic]][[i-1]])
+      iter <- 0
+      for(j in 1:m1_len) {
+        for(k in 1:length(E_ss_s_object[[i]])) {
+          iter <- iter + 1 
+          out[[ic]][[i]][[iter]] <- list()
+          out[[ic]][[i]][[iter]]$SS <- out[[ic]][[i-1]][[j]]$SS + E_ss_s_object[[i]][[k]]$SS
+          out[[ic]][[i]][[iter]]$lik <- out[[ic]][[i-1]][[j]]$lik + E_ss_s_object[[i]][[k]]$lik
+        }
+      }
+    }
+    lw_final_iter[[ic]] <- list()
+    ic_final_iter_ref <- length(out[[ic]])
+    lw_final_iter[[ic]] <- out[[ic]][[ic_final_iter_ref]]
+    ic_summed[[ic]] <- sumAcrossIc(x = lw_final_iter[[ic]], scores = seq(0, nitems, 1), theta = theta)
+  }
+  
+  return(ic_summed)
+}
+
+r_ssj2_test <- r_ssj2(E_ss_s_object = E_ss_s_object,
+                  L_ss_s_object = L_ss_s_object,
+                  nitems = 9,
+                  theta = theta)
+str(lw_emFoo)
+```
+
+
+- lw_em creates the equilivent of the rp in the lik. 
+- next i need to calculate the r_jk, which will require me to, w/in each ic, add the the output from lw_em
+  - so if a testee is correct or incorect their associated ss lik (from lw_em) is added to the r0 or r1 e-table
+
+# r_jk_ss 1
+- i believe this is incorrect. currently it is E_tables[["p"]][[ss_plus1]], which represents
+the ss. it should be E_tables[["p"]][[j]] representing the items
+```{r}
+r_jk_ss <- function(r_ssj_object, scores, theta,
+                    ic_ref, rp, rp_n, rp_ss) {
+  E_tables <- list() 
+  E_tables[["p"]] <- list() 
+  E_tables[["q"]] <- list()
+  zeroTraceSurface <- matrix(rep(0,length(theta)*length(theta)),
+                             nrow = length(theta),ncol = length(theta))
+  for(i in 1:length(scores)) {
+    ss_plus1 <- scores[i] + 1 # I do plus one bc i cannot index by 0 in R
+    E_tables[["p"]][[ss_plus1]] <- zeroTraceSurface
+    E_tables[["q"]][[ss_plus1]] <- zeroTraceSurface
+  }
+  for(j in 1:ncol(rp)) { # for j in 1:the number or items
+    for(i in 1:nrow(rp)) { #for i in 1: the number of unique rp
+      #### here 
+      rp_ss_plus1 <- rp_ss[i] + 1
+      if(rp[i,j] == 1) {
+        # so here I need to: 1. get the SS associated w/ the the rp 2. multiply it by the number of times the rp appears 3. get the SS from the ic the item comes from
+        E_tables[["p"]][[rp_ss_plus1]] <- E_tables[["p"]][[rp_ss_plus1]] + r_ssj_object[[ic_ref[[j]]]][[rp_ss_plus1]][["lik"]]#*rp_n[j]# this needs to reference an ic 
+      } else {
+        E_tables[["p"]][[rp_ss_plus1]] <- E_tables[["p"]][[rp_ss_plus1]] + (r_ssj_object[[ic_ref[[j]]]][[rp_ss_plus1]][["lik"]])*rp_n[j]# this needs to reference an ic
+      }
+    }
+  }
+  return(E_tables)
+}
+range(rp_n)
+```
+# r_jk_ss 
+```{r}
+r_jk_ss <- function(r_ssj_object, scores, theta,
+                    ic_ref, rp, rp_n, rp_ss) {
+  E_tables <- list() 
+  E_tables[["p"]] <- list() 
+  E_tables[["q"]] <- list()
+  zeroTraceSurface <- matrix(rep(0,length(theta)*length(theta)),
+                             nrow = length(theta),ncol = length(theta))
+  for(j in 1:ncol(rp)) { # for j in 1:the number or items
+    E_tables[["p"]][[j]] <- zeroTraceSurface
+    E_tables[["q"]][[j]] <- zeroTraceSurface
+    for(i in 1:nrow(rp)) { #for i in 1: the number of unique rp
+      #### here 
+      rp_ss_plus1 <- rp_ss[i] + 1
+      if(rp[i,j] == 1) {
+        # so here I need to: 1. get the SS associated w/ the the rp 2. multiply it by the number of times the rp appears 3. get the SS from the ic the item comes from
+        E_tables[["p"]][[j]] <- E_tables[["p"]][[j]] + r_ssj_object[[ic_ref[[j]]]][[rp_ss_plus1]][["lik"]]#*rp_n[j]# this needs to reference an ic 
+      } else {
+        E_tables[["p"]][[j]] <- E_tables[["p"]][[j]] + (r_ssj_object[[ic_ref[[j]]]][[rp_ss_plus1]][["lik"]])#*rp_n[j]# this needs to reference an ic
+      }
+    }
+  }
+  return(E_tables)
+}
+range(rp_n)
+```
+# Etables_update
+```{r}
+Etables_update <- function(a_gen, 
+                 a_spec, 
+                 b, 
+                 rp, 
+                 rp_n, # the tota number of rp
+                 #rp_count, # number of testees with each rp
+                 rp_ss,
+                 ic_ref, 
+                 theta) { 
+  # out is a list that will contain an item wise list, that also have sub lists by correct or incorrect responses. 
+  # put differently this list contains the E tables for each response 
+  out <- list() 
+
+  ts_list_object <- ts_list(a_gen = a_gen, a_spec = a_spec, b = d, rp = rp, rp_n = rp_n, ic_ref = ic_ref, theta = theta)
+
+  # calculating lw2_object
+  lw2_object <- lw2(ts_list_object = ts_list_object, theta = theta, ic_index = ic_index)
+
+  # calculating r_ssj_object
+  r_ssj_object <- r_ssj(lw2_object = lw2_object,theta = theta, ic_ref=ic_ref)
+  E_ss_s_object <- r_ssj_object[["E_ss_s_object"]]
+  L_ss_s_object <- r_ssj_object[["L_ss_s_object"]] 
+
+  # calculating r_ssj2_object
+  r_ssj2_object <- r_ssj2(E_ss_s_object = E_ss_s_object,
+                  L_ss_s_object = L_ss_s_object,
+                  nitems = length(a_gen),
+                  theta = theta)
+  # calculating r_jk_ss_object
+  r_jk_ss_object <- r_jk_ss(r_ssj_object = r_ssj2_object,
+                        scores = unique(rp_ss),
+                        theta = theta,
+                        rp = rp,
+                        rp_n = rp_n,
+                        ic_ref = ic_ref,
+                        rp_ss = rp_ss)
+
+  return(r_jk_ss_object)
+}
+str(r_ssj2_object)
+```
+
+# ss_bifactorEM
+```{r}
+ss_bifactorEM <- function(a_gen_start, 
+                 a_spec_start, 
+                 b_start, 
+                 scores,
+                 rp, 
+                 rp_n,
+                 rp_ss,
+                 #rp_count,
+                 ic_ref, 
+                 theta,
+                 niter = 25) {
+  
+   out <- list()
+   out[[1]] <- list()
+   paramIterList <- list()
+   logLik_vector <- numeric()
+   paramIterList[[1]] <- list()
+   paramIterList[[1]][[1]] <- numeric()
+   paramIterList[[1]][[2]] <- numeric()
+   paramIterList[[1]][[3]] <- numeric()
+   r_jk_allInOne_out <- r_jk_allInOne(a_gen = a_gen_start, a_spec = a_spec_start,b = b_start, 
+                             rp = rp, rp_n = nrow(rp), rp_count = rp_count, ic_ref = ic_ref,
+                             theta = theta)
+   E_tables <- r_jk_allInOne_out[["E_tables"]]
+   r1 <- E_tables[["p"]]
+   r0 <- E_tables[["q"]]
+   logLik_vector[1] <- r_jk_allInOne_out[["logLik"]]
+    
+    for(j in 1:length(a_spec_start)) {
+        out[[1]][[j]] <- nlm(f = bifactorll, p = c(a_gen_start[j],a_spec_start[j], b_start[j]),r1 = r1[[j]], r0 = r0[[j]], theta = theta)
+        paramIterList[[1]][[1]][j] <- out[[1]][[j]]$estimate[1]
+        paramIterList[[1]][[2]][j] <- out[[1]][[j]]$estimate[2]
+        paramIterList[[1]][[3]][j] <- out[[1]][[j]]$estimate[3]
+    }
+
+
+    for(iter in 2:niter) {
+        out[[iter]] <- list()
+        paramIterList[[iter]] <- list()
+        paramIterList[[iter]][[1]] <- numeric()
+        paramIterList[[iter]][[2]] <- numeric()
+        paramIterList[[iter]][[3]] <- numeric()
+        
+        r_jk_allInOne_out <- r_jk_allInOne(a_gen = unlist(paramIterList[[iter-1]][[1]]),
+                             a_spec = unlist(paramIterList[[iter-1]][[2]]),
+                             b = unlist(paramIterList[[iter-1]][[3]]), 
+                             rp = rp, rp_n = nrow(rp), rp_count = rp_count, ic_ref = ic_ref,
+                             theta = theta)
+        E_tables <- r_jk_allInOne_out[["E_tables"]]
+        r1 <- E_tables[["p"]]
+        r0 <- E_tables[["q"]]
+        logLik_vector[iter] <- r_jk_allInOne_out[["logLik"]]
+        
+        for(j in 1:length(a_spec_start)) {
+        out[[iter]][[j]] <- nlm(f = bifactorll, p = c(paramIterList[[iter-1]][[1]][j],
+                                                      paramIterList[[iter-1]][[2]][j],
+                                                      paramIterList[[iter-1]][[3]][j]),
+                                                      r1 = r1[[j]], r0 = r0[[j]], theta = theta)
+        paramIterList[[iter]][[1]][j] <- out[[iter]][[j]]$estimate[1]
+        paramIterList[[iter]][[2]][j] <- out[[iter]][[j]]$estimate[2]
+        paramIterList[[iter]][[3]][j] <- out[[iter]][[j]]$estimate[3]
+    }
+    }
+    out2 <- list()
+    out2[["paramIterList"]] <- paramIterList
+    out2[["logLik"]] <- logLik_vector
+    return(out2)
+}
+```
+
+### test ###
+```{r}
+# calculating ts_list_test
+ts_list_test <- ts_list(a_gen = c(.8,.4,.7, 
+                            .8,.4,.7,
+                            .8, .4,.7), 
+                             a_spec = rep(.4, 9), 
+                             b = d, 
+                             rp = dataset.2, 
+                             rp_n = rp_n, 
+                             ic_ref = c(1, 1, 1, 
+                                        2, 2, 2,
+                                        3, 3, 3), 
+                             theta = theta) 
+# calculating lw2_test
+lw2_test <- lw2(ts_list_object = ts_list_test, theta = theta, ic_index = c(1,1,1,2,2,2,3,3,3))
+
+# calculating r_ssj_test
+r_ssj_test <- r_ssj(lw2_object = lw2_test,theta = theta,ic_ref=c(1,1,1,2,2,2,3,3,3))
+
+r_ssj_object <- r_ssj_test[["r_ssj_object"]]
+E_ss_s_object <- r_ssj_test$E_ss_s_object
+#str(E_ss_s_object)
+L_ss_s_object <- r_ssj_test[["L_ss_s_object"]]
+
+# calculating r_ssj2_test
+r_ssj2_test <- r_ssj2(E_ss_s_object = E_ss_s_object,
+                  L_ss_s_object = L_ss_s_object,
+                  nitems = 9,
+                  theta = theta)
+str(r_ssj2_test)
+# calculating r_jk_ss_test
+r_jk_ss_test <- r_jk_ss(r_ssj_object = r_ssj2_test,
+                        scores = unique(dataset.2_ss),
+                        theta = theta,
+                        rp = dataset.2,
+                        rp_n = rp_n,
+                        ic_ref = c(1, 1, 1, 
+                                        2, 2, 2,
+                                        3, 3, 3),
+                        rp_ss = dataset.2_ss)
+
+# calculating Etables_update_test
+a_gen <- c(.8,.4,.7,.8,.4,.7,.8, .4,.7)
+a_spec <- rep(.4,9)
+ic_ref <- c(rep(1,3),rep(2,3),rep(3,3))
+Etables_update_test <- Etables_update(a_gen = a_gen, 
+                 a_spec = a_spec, 
+                 b = d, 
+                 rp = dataset.2, 
+                 rp_n = rp_n, # number of testees with each rp (this is rp_count in the rp version of the EM)
+                 #rp_count, # number of testees with each rp
+                 rp_ss = dataset.2_ss,
+                 ic_ref = ic_ref, 
+                 theta = theta)
+str(Etables_update_test)
+Etables_update_test[["p"]]
+str(r_jk_ss_test[[1]])
+r_jk_ss_test[[1]][[9]] == r_jk_ss_test[[1]][[4]]
+r_jk_ss_test[[1]][[1]]
+```
